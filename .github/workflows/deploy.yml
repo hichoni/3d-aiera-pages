@@ -1,0 +1,88 @@
+name: Deploy AIERA 3D
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: aiera-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Read the public application source
+        uses: actions/checkout@v4
+        with:
+          repository: hichoni/3d-modeling
+          ref: main
+          path: source
+          persist-credentials: false
+
+      - name: Check deployed source revision
+        id: revision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import {execFileSync} from 'node:child_process';
+          const sha=execFileSync('git',['-C','source','rev-parse','HEAD'],{encoding:'utf8'}).trim();
+          let changed=true;
+          if(process.env.EVENT_NAME==='schedule') {
+            try {
+              const r=await fetch('https://3d.aiera.co.kr/deployment.json',{signal:AbortSignal.timeout(15000)});
+              changed=!r.ok || (await r.json()).source_sha!==sha;
+            } catch { /* Missing site or first deployment: publish normally. */ }
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,`sha=${sha}\nchanged=${changed}\n`);
+          console.log(changed ? `Publishing source ${sha}` : `Already current: ${sha}`);
+          NODE
+
+      - name: Prepare the committed public site
+        if: steps.revision.outputs.changed == 'true'
+        env:
+          SOURCE_SHA: ${{ steps.revision.outputs.sha }}
+        run: |
+          mkdir public
+          git -C source archive HEAD | tar -x -C public
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          for(const p of ['index.html','home.html','studio.html','chromebook.html','downloads/click-studio-update.json']) {
+            if(!fs.existsSync('public/'+p))throw Error('Missing public artifact: '+p);
+          }
+          for(const p of ['runtime','artifacts','.env','.git']) {
+            if(fs.existsSync('public/'+p))throw Error('Unexpected private/runtime directory: '+p);
+          }
+          fs.writeFileSync('public/CNAME','3d.aiera.co.kr\n');
+          fs.writeFileSync('public/deployment.json',JSON.stringify({
+            source_repository:'hichoni/3d-modeling',source_sha:process.env.SOURCE_SHA,
+            deployed_at:new Date().toISOString(),site:'https://3d.aiera.co.kr/',
+            installed_app_origin:'https://hichoni.github.io'
+          },null,2)+'\n');
+          NODE
+
+      - name: Configure Pages
+        if: steps.revision.outputs.changed == 'true'
+        uses: actions/configure-pages@v5
+      - name: Upload public site
+        if: steps.revision.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - name: Deploy
+        if: steps.revision.outputs.changed == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
